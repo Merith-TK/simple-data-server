@@ -175,6 +175,9 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		if key == "" {
+			w.Header().Set("Content-Type", "application/json")
+		}
 		w.Write([]byte(data))
 	case "POST":
 		body, err := ioutil.ReadAll(r.Body)
