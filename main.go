@@ -1,10 +1,13 @@
 package main
 
 import (
-	"encoding/json"
+	"io/ioutil"
 	"log"
 	"net/http"
 	"strings"
+
+	"crypto/sha256"
+	"encoding/hex"
 
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
@@ -16,123 +19,182 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
+/*
+	FUNCTIONS:
+	* userHash
+		* get the user and password from the request and hash them to create a unique key
+		* return true and the user hash if the user and password are found
+		* return false and an empty string if the user and password are not found
+	* getData (from data.go)
+		* get the userhash, object, table, and key from the request
+		* if userhash is empty, return key from ./data/default/object/table.json
+		* if userhash is not  empty, return key from ./data/userhash/object/table.json
+		* if key is empty, return all keys from ./data/userhash/object/table.json or ./data/default/object/table.json if userhash is empty
+	* setData  (from data.go)
+		* get the userhash, object, table, key, and data from the request
+		* if userhash is empty, write data to ./data/default/object/table.json
+		* if userhash is not empty, write data to ./data/userhash/object/table.json
+		* if key is empty, do nothing
+	* deleteData  (from data.go)
+		* get the userhash, object, table, and key from the request
+		* if userhash is empty, delete key from ./data/default/object/table.json
+		* if userhash is not empty, delete key from ./data/userhash/object/table.json
+
+	WEB SOCKET FUNCTIONS:
+	* cmd: set key value
+		* sets the key to the value in the current object/table
+	* cmd: get key
+		* gets the value of the key in the current object/table
+	* cmd: del key
+		* deletes the key from the current object/table
+
+
+	USAGE:
+	* GET /api/object/table/key
+		* get the value of the key from the current object/table
+		* if userhash is empty, get the value from ./data/default/object/table.json
+		* if userhash is not empty, get the value from ./data/userhash/object/table.json
+	* GET /api/object/table
+		* get all keys from the current object/table
+		* if userhash is empty, get all keys from ./data/default/object/table.json
+		* if userhash is not empty, get all keys from ./data/userhash/object/table.json
+	* POST /api/object/table/key
+		* set the value of the key in the current object/table
+		* if userhash is empty, set the value in ./data/default/object/table.json
+		* if userhash is not empty, set the value in ./data/userhash/object/table.json
+	* DELETE /api/object/table/key
+		* delete the key from the current object/table
+		* if userhash is empty, delete the key from ./data/default/object/table.json
+		* if userhash is not empty, delete the key from ./data/userhash/object/table.json
+	* GET /api/object/table/ws
+		* upgrade the connection to a websocket
+		* send and receive commands to set, get, and delete keys
+
+*/
+
+func userHash(w http.ResponseWriter, r *http.Request) (bool, string) {
+	// get the user and password from the request
+	user, pass, ok := r.BasicAuth()
+	if !ok {
+		return false, "default"
+	}
+
+	// hash the user and password to create a unique key
+	data := []byte(user + pass)
+	hash := sha256.Sum256(data)
+	return true, hex.EncodeToString(hash[:])
+}
+
 func main() {
 	router := mux.NewRouter()
+	router.HandleFunc("/api/{object}/{table}/ws", handleWS)
+	router.HandleFunc("/api/{object}/{table}/{key}", handleAPI).Methods("GET", "POST", "DELETE")
+	router.HandleFunc("/api/{object}/{table}", handleAPI).Methods("GET")
 
-	// handle /api/<datapath>/<uuid>/ws
-	router.HandleFunc("/api/{datapath}/{uuid}", handleUUID)
-	router.HandleFunc("/api/{datapath}/{uuid}/ws", handleWebSocket)
+	http.Handle("/", router)
 	log.Println("Server started on port 8080")
-	log.Fatal(http.ListenAndServe(":8080", router))
-}
-
-func handleUUID(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	datapath := vars["datapath"]
-	uuid := vars["uuid"]
-
-	verifyFile(datapath, uuid)
-	data, err := readEntireData(datapath, uuid)
-	if err != nil {
-		log.Println("Failed to read data:", err)
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(data)
+	log.Fatal(http.ListenAndServe(":8080", nil))
 
 }
 
-func handleWebSocket(w http.ResponseWriter, r *http.Request) {
-	log.Println("Received websocket connection")
-	//  GET mux vars
+func handleWS(w http.ResponseWriter, r *http.Request) {
+	log.Println("Websocket connection")
+
+	// get the userhash, object, and table from the request
+	_, userhash := userHash(w, r)
+
 	vars := mux.Vars(r)
-	datapath := vars["datapath"]
-	uuid := vars["uuid"]
-	log.Printf("Received websocket connection for %s/%s\n", datapath, uuid)
-	verifyFile(datapath, uuid)
-	// ping pong
+	object := vars["object"]
+	table := vars["table"]
+	// upgrade the connection to a websocket
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Println("Failed to upgrade connection:", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	defer conn.Close()
+	log.Printf("Received websocket connection for %s/%s\n", object, table)
+	// send the userhash to the client
+	conn.WriteMessage(websocket.TextMessage, []byte("uuid: "+userhash))
 	for {
-		// client can send one of two commands
-		// 1. set key value
-		// 2. get key
-		// 3. del key
-		// 4. ping
-		_, message, err := conn.ReadMessage()
+		// read the command from the websocket
+		_, cmd, err := conn.ReadMessage()
 		if err != nil {
-			log.Println("Failed to read message:", err)
-			break
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
-		log.Printf("Received message: %s\n", message)
-		msg := string(message)
-		// split message into words
-		words := strings.Split(msg, " ")
-		command := words[0]
 
-		switch command {
+		// get the key and value from the command
+		parts := strings.Split(string(cmd), " ")
+		key := parts[1]
+		value := ""
+		if len(parts) == 3 {
+			value = parts[2]
+		}
+
+		// handle the command
+		switch parts[0] {
 		case "set":
-			if len(words) < 3 {
-				log.Println("Invalid message")
-				continue
-			}
-			key := words[1]
-			value := words[2]
-			err := writeData(datapath, uuid, key, value)
+			err := setData(userhash, object, table, key, value)
 			if err != nil {
-				log.Println("Failed to write data:", err)
-				continue
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
 			}
-			log.Printf("Set %s to %s\n", key, value)
+			conn.WriteMessage(websocket.TextMessage, []byte("SET: "+key))
 		case "get":
-			data, err := readData(datapath, uuid)
+			data, err := getData(userhash, object, table, key)
 			if err != nil {
-				log.Println("Failed to read data:", err)
-				continue
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
 			}
-			if len(words) < 2 {
-				log.Println("Invalid message")
-				continue
-			}
-			key := words[1]
-			value, ok := data.Data[key]
-			if !ok {
-				log.Printf("Key %s not found\n", key)
-				continue
-			}
-			log.Printf("Get %s: %s\n", key, value)
-			output := key + ": " + value
-			err = conn.WriteMessage(websocket.TextMessage, []byte(output))
-			if err != nil {
-				log.Println("Failed to write message:", err)
-				break
-			}
+			conn.WriteMessage(websocket.TextMessage, []byte(data))
 		case "del":
-			if len(words) < 2 {
-				log.Println("Invalid message")
-				continue
-			}
-			key := words[1]
-			err := deleteData(datapath, uuid, key)
+			err := deleteData(userhash, object, table, key)
 			if err != nil {
-				log.Println("Failed to delete data:", err)
-				continue
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
 			}
-			log.Printf("Deleted %s\n", key)
-		case "ping":
-			err := conn.WriteMessage(websocket.TextMessage, []byte("pong"))
-			if err != nil {
-				log.Println("Failed to write message:", err)
-				break
-			}
-		default:
-			log.Println("Invalid command")
+			conn.WriteMessage(websocket.TextMessage, []byte("Deleted "+key))
+		}
+	}
 
+}
+
+func handleAPI(w http.ResponseWriter, r *http.Request) {
+	// get the userhash, object, table, and key from the request
+	_, userhash := userHash(w, r)
+
+	vars := mux.Vars(r)
+	object := vars["object"]
+	table := vars["table"]
+	key := vars["key"]
+
+	switch r.Method {
+	case "GET":
+		data, err := getData(userhash, object, table, key)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Write([]byte(data))
+	case "POST":
+		body, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
 
+		err = setData(userhash, object, table, key, string(body))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Write([]byte("SET: " + key))
+	case "DELETE":
+		err := deleteData(userhash, object, table, key)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Write([]byte("Deleted " + key))
 	}
 }
