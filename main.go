@@ -105,7 +105,8 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			log.Printf("Get %s: %s\n", key, value)
-			err = conn.WriteMessage(websocket.TextMessage, []byte(value))
+			output := key + ": " + value
+			err = conn.WriteMessage(websocket.TextMessage, []byte(output))
 			if err != nil {
 				log.Println("Failed to write message:", err)
 				break
