@@ -1,5 +1,5 @@
-﻿# simple-data-server
-
+﻿# NOTICE:
+This project stores the data as plaintext files on the server host, if you are concerned about this, please do not store un-encrypted sensitive data on the server. 
 
 ## https
   - `https://sds.merith.xyz/api/<object>/<table>/<key>`
