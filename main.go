@@ -126,14 +126,11 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 		// get the key and value from the command
 		parts := strings.Split(string(cmd), " ")
 		key := parts[1]
-		value := ""
-		if len(parts) == 3 {
-			value = parts[2]
-		}
 
 		// handle the command
 		switch parts[0] {
 		case "set":
+			value := strings.Join(parts[2:], " ")
 			err := setData(userhash, object, table, key, value)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
