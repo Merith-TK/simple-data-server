@@ -167,6 +167,7 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 			}
 			conn.WriteMessage(websocket.TextMessage, []byte("Deleted "+key))
 		case "exit":
+			conn.WriteMessage(websocket.TextMessage, []byte("Exiting"))
 			conn.Close()
 		default:
 			conn.WriteMessage(websocket.TextMessage, []byte("Unknown command: "+parts[0]))
