@@ -1,7 +1,7 @@
 package main
 
 import (
-	"io/ioutil"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -106,6 +106,7 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	object := vars["object"]
 	table := vars["table"]
+
 	// upgrade the connection to a websocket
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -113,13 +114,26 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("Received websocket connection for %s/%s\n", object, table)
+
+	// add client to the list of clients
+	endpointString := userhash + "/" + object + "/" + table
+	clients[endpointString] = append(clients[endpointString], conn)
+
 	// send the userhash to the client
 	conn.WriteMessage(websocket.TextMessage, []byte("uuid: "+userhash))
 	for {
 		// read the command from the websocket
 		_, cmd, err := conn.ReadMessage()
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			log.Printf("Client disconnected: %v\n", err)
+			// find the client in the list of clients and remove it
+			for i, c := range clients[endpointString] {
+				if c == conn {
+					clients[endpointString] = append(clients[endpointString][:i], clients[endpointString][i+1:]...)
+					break
+				}
+			}
+
 			return
 		}
 
@@ -136,7 +150,8 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
-			conn.WriteMessage(websocket.TextMessage, []byte("SET: "+key))
+			// conn.WriteMessage(websocket.TextMessage, []byte("SET: "+key))
+			sendMsg(endpointString, "UPDATE: "+key+": "+value)
 		case "get":
 			data, err := getData(userhash, object, table, key)
 			if err != nil {
@@ -151,9 +166,12 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			conn.WriteMessage(websocket.TextMessage, []byte("Deleted "+key))
+		case "exit":
+			conn.Close()
+		default:
+			conn.WriteMessage(websocket.TextMessage, []byte("Unknown command: "+parts[0]))
 		}
 	}
-
 }
 
 func handleAPI(w http.ResponseWriter, r *http.Request) {
@@ -177,7 +195,7 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Write([]byte(data))
 	case "POST":
-		body, err := ioutil.ReadAll(r.Body)
+		body, err := io.ReadAll(r.Body)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
