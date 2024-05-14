@@ -145,6 +145,9 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 		switch parts[0] {
 		case "set":
 			value := strings.Join(parts[2:], " ")
+			if len(parts) == 2 {
+				value = ""
+			}
 			err := setData(userhash, object, table, key, value)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
