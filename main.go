@@ -140,9 +140,10 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 		// get the key and value from the command
 		parts := strings.Split(string(cmd), " ")
 		key := parts[1]
-
+		cmd1 := parts[0]
+		cmdstr := strings.ToLower(string(cmd1))
 		// handle the command
-		switch parts[0] {
+		switch cmdstr {
 		case "set":
 			value := strings.Join(parts[2:], " ")
 			if len(parts) == 2 {
