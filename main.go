@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"io"
 	"log"
 	"net/http"
@@ -15,8 +16,35 @@ import (
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
-		return true
+		return true // TODO: Make this configurable for production
 	},
+}
+
+type ErrorResponse struct {
+	Error   string `json:"error"`
+	Message string `json:"message,omitempty"`
+}
+
+// Helper function to send JSON error responses
+func sendErrorResponse(w http.ResponseWriter, statusCode int, errMsg string, details ...string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(statusCode)
+
+	response := ErrorResponse{
+		Error: errMsg,
+	}
+	if len(details) > 0 {
+		response.Message = details[0]
+	}
+
+	json.NewEncoder(w).Encode(response)
+}
+
+// Helper function to send success response
+func sendSuccessResponse(w http.ResponseWriter, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	response := map[string]string{"status": "success", "message": message}
+	json.NewEncoder(w).Encode(response)
 }
 
 /*
@@ -86,15 +114,25 @@ func userHash(w http.ResponseWriter, r *http.Request) (bool, string) {
 }
 
 func main() {
+	config := loadConfig()
+
 	router := mux.NewRouter()
 	router.HandleFunc("/api/{object}/{table}/ws", handleWS)
 	router.HandleFunc("/api/{object}/{table}/{key}", handleAPI).Methods("GET", "POST", "DELETE")
 	router.HandleFunc("/api/{object}/{table}", handleAPI).Methods("GET")
 
-	http.Handle("/", router)
-	log.Println("Server started on port 8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	// Add a health check endpoint
+	router.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		sendSuccessResponse(w, "Server is healthy")
+	})
 
+	// Add middleware
+	handler := LoggingMiddleware(CORSMiddleware(router))
+
+	http.Handle("/", handler)
+	log.Printf("Server started on port %s", config.Port)
+	log.Printf("Data directory: %s", config.DataDir)
+	log.Fatal(http.ListenAndServe(":"+config.Port, nil))
 }
 
 func handleWS(w http.ResponseWriter, r *http.Request) {
@@ -110,71 +148,85 @@ func handleWS(w http.ResponseWriter, r *http.Request) {
 	// upgrade the connection to a websocket
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Printf("Failed to upgrade connection: %v", err)
+		sendErrorResponse(w, http.StatusInternalServerError, "Failed to upgrade connection", err.Error())
 		return
 	}
+	defer conn.Close()
+
 	log.Printf("Received websocket connection for %s/%s\n", object, table)
 
 	// add client to the list of clients
 	endpointString := userhash + "/" + object + "/" + table
-	clients[endpointString] = append(clients[endpointString], conn)
+	addClient(endpointString, conn)
+	defer removeClient(endpointString, conn)
 
 	// send the userhash to the client
-	conn.WriteMessage(websocket.TextMessage, []byte("uuid: "+userhash))
+	if err := conn.WriteMessage(websocket.TextMessage, []byte("uuid: "+userhash)); err != nil {
+		log.Printf("Error sending initial message: %v", err)
+		return
+	}
+
 	for {
 		// read the command from the websocket
 		_, cmd, err := conn.ReadMessage()
 		if err != nil {
 			log.Printf("Client disconnected: %v\n", err)
-			// find the client in the list of clients and remove it
-			for i, c := range clients[endpointString] {
-				if c == conn {
-					clients[endpointString] = append(clients[endpointString][:i], clients[endpointString][i+1:]...)
-					break
-				}
-			}
-
 			return
 		}
 
 		// get the key and value from the command
 		parts := strings.Split(string(cmd), " ")
+		if len(parts) < 2 {
+			conn.WriteMessage(websocket.TextMessage, []byte("Error: Invalid command format"))
+			continue
+		}
+
 		key := parts[1]
 		cmd1 := parts[0]
 		cmdstr := strings.ToLower(string(cmd1))
+
 		// handle the command
 		switch cmdstr {
 		case "set":
-			value := strings.Join(parts[2:], " ")
-			if len(parts) == 2 {
-				value = ""
+			value := ""
+			if len(parts) > 2 {
+				value = strings.Join(parts[2:], " ")
 			}
+
 			err := setData(userhash, object, table, key, value)
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
+				log.Printf("Error setting data via websocket: %v", err)
+				conn.WriteMessage(websocket.TextMessage, []byte("Error: "+err.Error()))
+				continue
 			}
-			// conn.WriteMessage(websocket.TextMessage, []byte("SET: "+key))
 			sendMsg(endpointString, "UPDATE: "+key+": "+value)
+
 		case "get":
 			data, err := getData(userhash, object, table, key)
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
+				log.Printf("Error getting data via websocket: %v", err)
+				conn.WriteMessage(websocket.TextMessage, []byte("Error: "+err.Error()))
+				continue
 			}
-			conn.WriteMessage(websocket.TextMessage, []byte(data))
+			conn.WriteMessage(websocket.TextMessage, []byte(key+": "+data))
+
 		case "del":
 			err := deleteData(userhash, object, table, key)
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
+				log.Printf("Error deleting data via websocket: %v", err)
+				conn.WriteMessage(websocket.TextMessage, []byte("Error: "+err.Error()))
+				continue
 			}
-			conn.WriteMessage(websocket.TextMessage, []byte("Deleted "+key))
+			conn.WriteMessage(websocket.TextMessage, []byte("Deleted: "+key))
+			sendMsg(endpointString, "DELETED: "+key)
+
 		case "exit":
-			conn.WriteMessage(websocket.TextMessage, []byte("Exiting"))
-			conn.Close()
+			conn.WriteMessage(websocket.TextMessage, []byte("Goodbye"))
+			return
+
 		default:
-			conn.WriteMessage(websocket.TextMessage, []byte("Unknown command: "+parts[0]))
+			conn.WriteMessage(websocket.TextMessage, []byte("Error: Unknown command: "+parts[0]))
 		}
 	}
 }
@@ -192,32 +244,52 @@ func handleAPI(w http.ResponseWriter, r *http.Request) {
 	case "GET":
 		data, err := getData(userhash, object, table, key)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			log.Printf("Error getting data: %v", err)
+			sendErrorResponse(w, http.StatusInternalServerError, "Failed to retrieve data", err.Error())
 			return
 		}
 		if key == "" {
 			w.Header().Set("Content-Type", "application/json")
+		} else {
+			w.Header().Set("Content-Type", "text/plain")
 		}
 		w.Write([]byte(data))
+
 	case "POST":
+		// Validate that key is provided for POST
+		if key == "" {
+			sendErrorResponse(w, http.StatusBadRequest, "Key is required for POST requests")
+			return
+		}
+
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			log.Printf("Error reading request body: %v", err)
+			sendErrorResponse(w, http.StatusBadRequest, "Failed to read request body", err.Error())
 			return
 		}
 
 		err = setData(userhash, object, table, key, string(body))
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			log.Printf("Error setting data: %v", err)
+			sendErrorResponse(w, http.StatusInternalServerError, "Failed to set data", err.Error())
 			return
 		}
-		w.Write([]byte("SET: " + key))
+		sendSuccessResponse(w, "Data set successfully for key: "+key)
+
 	case "DELETE":
+		// Validate that key is provided for DELETE
+		if key == "" {
+			sendErrorResponse(w, http.StatusBadRequest, "Key is required for DELETE requests")
+			return
+		}
+
 		err := deleteData(userhash, object, table, key)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			log.Printf("Error deleting data: %v", err)
+			sendErrorResponse(w, http.StatusInternalServerError, "Failed to delete data", err.Error())
 			return
 		}
-		w.Write([]byte("Deleted " + key))
+		sendSuccessResponse(w, "Data deleted successfully for key: "+key)
 	}
 }

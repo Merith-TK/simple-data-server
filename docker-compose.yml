@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  simple-data-server:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+    environment:
+      - PORT=8080
+      - DATA_DIR=/data
+      - LOG_LEVEL=info
+    restart: unless-stopped
